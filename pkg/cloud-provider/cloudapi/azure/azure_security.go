@@ -21,7 +21,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-03-01/network"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork"
 	"github.com/Azure/go-autorest/autorest/to"
 	"go.uber.org/multierr"
 	"k8s.io/apimachinery/pkg/types"
@@ -126,8 +126,8 @@ func (computeCfg *computeServiceConfig) processAppliedToMembership(appliedToGrou
 		nwIntfIDSetNsgToDettach, appliedToGroupOriginalNameToBeUsedAsTag)
 }
 
-func (computeCfg *computeServiceConfig) processNsgAttachDetachConcurrently(nsgObj network.SecurityGroup,
-	asgObj network.ApplicationSecurityGroup, nwIntfIDSetNsgToAttach map[string]struct{},
+func (computeCfg *computeServiceConfig) processNsgAttachDetachConcurrently(nsgObj armnetwork.SecurityGroup,
+	asgObj armnetwork.ApplicationSecurityGroup, nwIntfIDSetNsgToAttach map[string]struct{},
 	nwIntfIDSetNsgToDetach map[string]struct{}, nwIntfTagKeyToUpdate string) error {
 	allNwIntfIDs := mergeSet(nwIntfIDSetNsgToAttach, nwIntfIDSetNsgToDetach)
 
@@ -154,7 +154,7 @@ func (computeCfg *computeServiceConfig) processNsgAttachDetachConcurrently(nsgOb
 			isAttach = true
 		}
 
-		go func(nwIntfObj network.Interface, nsgObj network.SecurityGroup, isAttach bool, ch chan error) {
+		go func(nwIntfObj armnetwork.Interface, nsgObj armnetwork.SecurityGroup, isAttach bool, ch chan error) {
 			defer wg.Done()
 			ch <- updateNetworkInterfaceNsg(nwIntfAPIClient, nwIntfObj, nsgObj, asgObj, isAttach, nwIntfTagKeyToUpdate)
 		}(nwIntfObj, nsgObj, isAttach, ch)
@@ -221,7 +221,7 @@ func (computeCfg *computeServiceConfig) processAddressGroupMembership(addressGro
 	return computeCfg.processAsgAttachDetachConcurrently(asgObj, nwIntfIDSetAsgToAttach, nwIntfIDSetAsgToDettach)
 }
 
-func (computeCfg *computeServiceConfig) processAsgAttachDetachConcurrently(asgObj network.ApplicationSecurityGroup,
+func (computeCfg *computeServiceConfig) processAsgAttachDetachConcurrently(asgObj armnetwork.ApplicationSecurityGroup,
 	nwIntfIDSetAsgToAttach map[string]struct{}, nwIntfIDSetAsgToDetach map[string]struct{}) error {
 	allNwIntfIDs := mergeSet(nwIntfIDSetAsgToAttach, nwIntfIDSetAsgToDetach)
 
@@ -248,7 +248,7 @@ func (computeCfg *computeServiceConfig) processAsgAttachDetachConcurrently(asgOb
 			isAttach = true
 		}
 
-		go func(nwIntfObj network.Interface, asgObj network.ApplicationSecurityGroup, isAttach bool, ch chan error) {
+		go func(nwIntfObj armnetwork.Interface, asgObj armnetwork.ApplicationSecurityGroup, isAttach bool, ch chan error) {
 			defer wg.Done()
 			ch <- updateNetworkInterfaceAsg(nwIntfAPIClient, nwIntfObj, asgObj, isAttach)
 		}(nwIntfObj, asgObj, isAttach, ch)
@@ -265,24 +265,32 @@ func (computeCfg *computeServiceConfig) processAsgAttachDetachConcurrently(asgOb
 // buildEffectiveNSGSecurityRulesToApply prepares the update rule cloud api payload from internal rules.
 func (computeCfg *computeServiceConfig) buildEffectiveNSGSecurityRulesToApply(appliedToGroupID *securitygroup.CloudResourceID,
 	ingressRules []*securitygroup.CloudRule, egressRules []*securitygroup.CloudRule, perVnetAppliedToNsgName string,
-	rgName string) ([]network.SecurityRule, error) {
+	rgName string) ([]*armnetwork.SecurityRule, error) {
 	// get current rules for applied to SG azure NSG
 	nsgObj, err := computeCfg.nsgAPIClient.get(context.Background(), rgName, perVnetAppliedToNsgName, "")
 	if err != nil {
-		return []network.SecurityRule{}, err
+		return []*armnetwork.SecurityRule{}, err
 	}
 
-	var currentNsgIngressRules []network.SecurityRule
-	var currentNsgEgressRules []network.SecurityRule
-	currentNsgSecurityRules := nsgObj.SecurityRules
+	if nsgObj.Properties == nil {
+		return nil, fmt.Errorf("properties field empty in nsg object %s", *nsgObj.ID)
+	}
+	var currentNsgIngressRules []armnetwork.SecurityRule
+	var currentNsgEgressRules []armnetwork.SecurityRule
+	currentNsgSecurityRules := nsgObj.Properties.SecurityRules
 	appliedToGroupNepheControllerName := appliedToGroupID.GetCloudName(false)
 	azurePluginLogger().Info("building security rules", "applied to security group", appliedToGroupNepheControllerName)
-	for _, rule := range *currentNsgSecurityRules {
-		// skip any rules not created by nephe
-		if rule.Description == nil {
+	for _, rule := range currentNsgSecurityRules {
+		azurePluginLogger().Info("Test: buildEffectiveNSGSecurityRulesToApply", "current nsg rule", rule)
+		if rule.Properties == nil {
+			azurePluginLogger().Info("Test: skip rule as Properties field is empty")
 			continue
 		}
-		ruleAddrGroupName := *rule.Description
+		// skip any rules not created by nephe
+		if rule.Properties.Description == nil {
+			continue
+		}
+		ruleAddrGroupName := *rule.Properties.Description
 		_, _, isNepheControllerCreatedRule := securitygroup.IsNepheControllerCreatedSG(ruleAddrGroupName)
 		if !isNepheControllerCreatedRule {
 			continue
@@ -291,60 +299,79 @@ func (computeCfg *computeServiceConfig) buildEffectiveNSGSecurityRulesToApply(ap
 		if strings.Compare(ruleAddrGroupName, appliedToGroupNepheControllerName) == 0 {
 			continue
 		}
-		if rule.Direction == network.SecurityRuleDirectionInbound {
-			currentNsgIngressRules = append(currentNsgIngressRules, rule)
+		if *rule.Properties.Direction == armnetwork.SecurityRuleDirectionInbound {
+			azurePluginLogger().Info("Test: buildEffectiveNSGSecurityRulesToApply, inside  SecurityRuleDirectionInbound direction")
+			currentNsgIngressRules = append(currentNsgIngressRules, *rule)
 		} else {
-			currentNsgEgressRules = append(currentNsgEgressRules, rule)
+			currentNsgEgressRules = append(currentNsgEgressRules, *rule)
 		}
 	}
 
 	agAsgMapByNepheControllerName, atAsgMapByNepheControllerName, err := getNepheControllerCreatedAsgByNameForResourceGroup(
 		computeCfg.asgAPIClient, rgName)
 	if err != nil {
-		return []network.SecurityRule{}, err
+		return []*armnetwork.SecurityRule{}, err
 	}
 
 	newIngressSecurityRules, err := convertIngressToNsgSecurityRules(appliedToGroupID, ingressRules,
 		agAsgMapByNepheControllerName, atAsgMapByNepheControllerName)
 	if err != nil {
-		return []network.SecurityRule{}, err
+		return []*armnetwork.SecurityRule{}, err
 	}
 	newEgressSecurityRules, err := convertEgressToNsgSecurityRules(appliedToGroupID, egressRules,
 		agAsgMapByNepheControllerName, atAsgMapByNepheControllerName)
 	if err != nil {
-		return []network.SecurityRule{}, err
+		return []*armnetwork.SecurityRule{}, err
 	}
 	allIngressRules := updateSecurityRuleNameAndPriority(currentNsgIngressRules, newIngressSecurityRules)
 	allEgressRules := updateSecurityRuleNameAndPriority(currentNsgEgressRules, newEgressSecurityRules)
 
-	var rules []network.SecurityRule
-	rules = append(rules, allIngressRules...)
-	rules = append(rules, allEgressRules...)
+	rules := make([]*armnetwork.SecurityRule, 0)
+	for ind, _ := range allIngressRules {
+		azurePluginLogger().Info("Test: adding to final slice", "rule", &allIngressRules[ind])
+		rules = append(rules, &allIngressRules[ind])
+	}
+	for ind, _ := range allEgressRules {
+		azurePluginLogger().Info("Test: adding to final slice", "rule", &allEgressRules[ind])
+		rules = append(rules, &allEgressRules[ind])
+	}
 
+	for _, rule := range rules {
+		azurePluginLogger().Info("Test: reprint rules", "rule", rule)
+	}
+	azurePluginLogger().Info("Test: size of final slice", "len rule", len(rules))
 	return rules, nil
 }
 
 // buildEffectivePeerNSGSecurityRulesToApply prepares the update rule cloud api payload from internal rules that require peering.
 func (computeCfg *computeServiceConfig) buildEffectivePeerNSGSecurityRulesToApply(appliedToGroupID *securitygroup.CloudResourceID,
 	ingressRules []*securitygroup.CloudRule, egressRules []*securitygroup.CloudRule, perVnetAppliedToNsgName string,
-	rgName string, ruleIP *string) ([]network.SecurityRule, error) {
+	rgName string, ruleIP *string) ([]*armnetwork.SecurityRule, error) {
 	// get current rules for applied to SG azure NSG
 	nsgObj, err := computeCfg.nsgAPIClient.get(context.Background(), rgName, perVnetAppliedToNsgName, "")
 	if err != nil {
-		return []network.SecurityRule{}, err
+		return []*armnetwork.SecurityRule{}, err
 	}
 
-	var currentNsgIngressRules []network.SecurityRule
-	var currentNsgEgressRules []network.SecurityRule
-	currentNsgSecurityRules := nsgObj.SecurityRules
+	if nsgObj.Properties == nil {
+		return nil, fmt.Errorf("properties field empty in nsg object %s", *nsgObj.ID)
+	}
+	var currentNsgIngressRules []armnetwork.SecurityRule
+	var currentNsgEgressRules []armnetwork.SecurityRule
+	currentNsgSecurityRules := nsgObj.Properties.SecurityRules
 	appliedToGroupNepheControllerName := appliedToGroupID.GetCloudName(false)
 	azurePluginLogger().Info("building peering security rules", "applied to security group", appliedToGroupNepheControllerName)
-	for _, rule := range *currentNsgSecurityRules {
-		// skip any rules not created by nephe
-		if rule.Description == nil {
+	for _, rule := range currentNsgSecurityRules {
+		if rule.Properties == nil {
+			azurePluginLogger().Info("Test: skip rule as Properties field is empty")
 			continue
 		}
-		ruleAddrGroupName := *rule.Description
+
+		// skip any rules not created by nephe
+		if rule.Properties.Description == nil {
+			continue
+		}
+		ruleAddrGroupName := *rule.Properties.Description
 		_, _, isNepheControllerCreatedRule := securitygroup.IsNepheControllerCreatedSG(ruleAddrGroupName)
 		if !isNepheControllerCreatedRule {
 			continue
@@ -353,34 +380,38 @@ func (computeCfg *computeServiceConfig) buildEffectivePeerNSGSecurityRulesToAppl
 		if strings.Compare(ruleAddrGroupName, appliedToGroupNepheControllerName) == 0 {
 			continue
 		}
-		if rule.Direction == network.SecurityRuleDirectionInbound {
-			currentNsgIngressRules = append(currentNsgIngressRules, rule)
+		if *rule.Properties.Direction == armnetwork.SecurityRuleDirectionInbound {
+			currentNsgIngressRules = append(currentNsgIngressRules, *rule)
 		} else {
-			currentNsgEgressRules = append(currentNsgEgressRules, rule)
+			currentNsgEgressRules = append(currentNsgEgressRules, *rule)
 		}
 	}
 
 	agAsgMapByNepheControllerName, _, err := getNepheControllerCreatedAsgByNameForResourceGroup(computeCfg.asgAPIClient, rgName)
 	if err != nil {
-		return []network.SecurityRule{}, err
+		return []*armnetwork.SecurityRule{}, err
 	}
 
 	newIngressSecurityRules, err := convertIngressToPeerNsgSecurityRules(appliedToGroupID, ingressRules,
 		agAsgMapByNepheControllerName, ruleIP)
 	if err != nil {
-		return []network.SecurityRule{}, err
+		return []*armnetwork.SecurityRule{}, err
 	}
 	newEgressSecurityRules, err := convertEgressToPeerNsgSecurityRules(appliedToGroupID, egressRules,
 		agAsgMapByNepheControllerName, ruleIP)
 	if err != nil {
-		return []network.SecurityRule{}, err
+		return []*armnetwork.SecurityRule{}, err
 	}
 	allIngressRules := updateSecurityRuleNameAndPriority(currentNsgIngressRules, newIngressSecurityRules)
 	allEgressRules := updateSecurityRuleNameAndPriority(currentNsgEgressRules, newEgressSecurityRules)
 
-	var rules []network.SecurityRule
-	rules = append(rules, allIngressRules...)
-	rules = append(rules, allEgressRules...)
+	var rules []*armnetwork.SecurityRule
+	for ind, _ := range allIngressRules {
+		rules = append(rules, &allIngressRules[ind])
+	}
+	for ind, _ := range allEgressRules {
+		rules = append(rules, &allEgressRules[ind])
+	}
 
 	return rules, nil
 }
@@ -433,7 +464,10 @@ func (computeCfg *computeServiceConfig) removeReferencesToSecurityGroup(id *secu
 	if err != nil {
 		return err
 	}
-	if nsgObj.SecurityRules == nil {
+	if nsgObj.Properties == nil {
+		return fmt.Errorf("properties field empty in nsg %s", *nsgObj.ID)
+	}
+	if nsgObj.Properties.SecurityRules == nil {
 		return nil
 	}
 	var asgName string
@@ -443,14 +477,17 @@ func (computeCfg *computeServiceConfig) removeReferencesToSecurityGroup(id *secu
 	} else {
 		asgName = id.GetCloudName(membershiponly)
 	}
-	currentNsgRules := *nsgObj.SecurityRules
-	var rulesToKeep []network.SecurityRule
+	currentNsgRules := nsgObj.Properties.SecurityRules
+	var rulesToKeep []*armnetwork.SecurityRule
 	nsgUpdateRequired := false
 	for _, rule := range currentNsgRules {
+		if rule.Properties == nil {
+			azurePluginLogger().Info("Test: Properties field empty in a rule")
+		}
 		srcAsgUpdated := false
 		dstAsgUpdated := false
-		srcAsgs := rule.SourceApplicationSecurityGroups
-		if srcAsgs != nil && len(*srcAsgs) != 0 {
+		srcAsgs := rule.Properties.SourceApplicationSecurityGroups
+		if len(srcAsgs) != 0 {
 			asgsToKeep, updated := getAsgsToAdd(srcAsgs, asgName)
 			if updated {
 				srcAsgs = asgsToKeep
@@ -458,8 +495,8 @@ func (computeCfg *computeServiceConfig) removeReferencesToSecurityGroup(id *secu
 				srcAsgUpdated = true
 			}
 		}
-		dstAsgs := rule.DestinationApplicationSecurityGroups
-		if dstAsgs != nil && len(*dstAsgs) != 0 {
+		dstAsgs := rule.Properties.DestinationApplicationSecurityGroups
+		if len(dstAsgs) != 0 {
 			asgsToKeep, updateRequired := getAsgsToAdd(dstAsgs, asgName)
 			if updateRequired {
 				dstAsgs = asgsToKeep
@@ -484,11 +521,11 @@ func (computeCfg *computeServiceConfig) removeReferencesToSecurityGroup(id *secu
 	return err
 }
 
-func getAsgsToAdd(asgs *[]network.ApplicationSecurityGroup, addrGroupNepheControllerName string) (
-	*[]network.ApplicationSecurityGroup, bool) {
-	var asgsToKeep []network.ApplicationSecurityGroup
+func getAsgsToAdd(asgs []*armnetwork.ApplicationSecurityGroup, addrGroupNepheControllerName string) (
+	[]*armnetwork.ApplicationSecurityGroup, bool) {
+	var asgsToKeep []*armnetwork.ApplicationSecurityGroup
 	updated := false
-	for _, asg := range *asgs {
+	for _, asg := range asgs {
 		_, _, asgName, err := extractFieldsFromAzureResourceID(*asg.ID)
 		if err != nil {
 			azurePluginLogger().Error(err, "invalid azure resource ID")
@@ -503,7 +540,7 @@ func getAsgsToAdd(asgs *[]network.ApplicationSecurityGroup, addrGroupNepheContro
 	if len(asgsToKeep) == 0 {
 		return nil, updated
 	}
-	return &asgsToKeep, updated
+	return asgsToKeep, updated
 }
 
 // processAndBuildATSgView creates synchronization content for AppliedTo SG.
@@ -628,8 +665,12 @@ func (computeCfg *computeServiceConfig) getATGroupView(nepheControllerATSGNameTo
 		if !found {
 			continue
 		}
+		if networkSecurityGroup.Properties == nil {
+			azurePluginLogger().Info("Test:Properties in nsg is nil")
+			continue
+		}
 		nepheControllerATSgNameToIngressRulesMap, nepheControllerATSgNameToEgressRulesMap :=
-			convertToInternalRulesByAppliedToSGName(networkSecurityGroup.SecurityRules, vnetIDLowercase)
+			convertToInternalRulesByAppliedToSGName(networkSecurityGroup.Properties.SecurityRules, vnetIDLowercase)
 
 		for atSgName := range appliedToSgNameSet {
 			resource := securitygroup.CloudResource{
@@ -753,6 +794,7 @@ func (c *azureCloud) CreateSecurityGroup(securityGroupIdentifier *securitygroup.
 
 		// create azure asg corresponding to AT sg.
 		cloudAsgName := securityGroupIdentifier.GetCloudName(false)
+		azurePluginLogger().Info("Test: calling create sg", "at", cloudAsgName)
 		_, err = createOrGetApplicationSecurityGroup(computeService.asgAPIClient, location, rgName, cloudAsgName)
 		if err != nil {
 			return nil, fmt.Errorf("azure asg %v create failed for AT sg %v, reason: %w", cloudAsgName, securityGroupIdentifier.Name, err)
@@ -820,7 +862,7 @@ func (c *azureCloud) UpdateSecurityGroupRules(appliedToGroupIdentifier *security
 	suffix := tokens[len(tokens)-1]
 	appliedToGroupPerVnetNsgNepheControllerName := appliedToSgID.GetCloudName(false) + "-" + suffix
 	// convert to azure security rules and build effective rules to be applied to AT sg azure NSG
-	rules := []network.SecurityRule{}
+	rules := []*armnetwork.SecurityRule{}
 	flag := 0
 	for _, vnetPeerPair := range vnetPeerPairs {
 		vnetPeerID, _, _ := vnetPeerPair[0], vnetPeerPair[1], vnetPeerPair[2]
